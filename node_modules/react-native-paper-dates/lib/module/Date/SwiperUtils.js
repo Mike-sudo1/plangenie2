@@ -1,0 +1,66 @@
+"use strict";
+
+import { useEffect } from 'react';
+import { useLatest } from '../shared/utils';
+import { addMonths, differenceInMonths, getRealIndex, getStartAtIndex, getTotalMonths } from './dateUtils';
+import { defaultStartYear, defaultEndYear } from './dateUtils';
+// Helper function to get the minimum allowed index based on startYear
+export function getMinIndex(startYear, endYear) {
+  if (!startYear) return 0;
+  const today = new Date();
+  const startDate = new Date(startYear, 0, 1); // January 1st of startYear
+  const months = differenceInMonths(today, startDate);
+  const dynamicStartAtIndex = getStartAtIndex(startYear, endYear);
+  const minIndex = dynamicStartAtIndex + months;
+  const totalMonths = getTotalMonths(startYear, endYear);
+
+  // Allow any valid index within the dynamic range, no hard minimum
+  return Math.max(0, Math.min(minIndex, totalMonths - 1));
+}
+
+// Helper function to get the maximum allowed index based on endYear
+export function getMaxIndex(startYear, endYear) {
+  const dynamicStartAtIndex = getStartAtIndex(startYear, endYear);
+  const totalMonths = getTotalMonths(startYear, endYear);
+  if (!endYear) return totalMonths - 1;
+  const today = new Date();
+  const endDate = new Date(endYear, 11, 31); // December 31st of endYear
+  const months = differenceInMonths(today, endDate);
+  const maxIndex = dynamicStartAtIndex + months;
+
+  // Allow any valid index within the dynamic range
+  return Math.max(0, Math.min(maxIndex, totalMonths - 1));
+}
+
+// Helper function to check if an index is within allowed range
+export function isIndexWithinRange(index, startYear, endYear) {
+  const minIndex = getMinIndex(startYear || defaultStartYear, endYear);
+  const maxIndex = getMaxIndex(startYear, endYear || defaultEndYear);
+  return index >= minIndex && index <= maxIndex;
+}
+export function useYearChange(onChange, {
+  selectedYear,
+  currentIndexRef,
+  startYear,
+  endYear
+}) {
+  const onChangeRef = useLatest(onChange);
+  useEffect(() => {
+    if (selectedYear) {
+      const currentIndex = currentIndexRef.current || 0;
+      const currentDate = addMonths(new Date(), getRealIndex(currentIndex, startYear, endYear));
+      currentDate.setFullYear(selectedYear);
+      const today = new Date();
+      const months = differenceInMonths(today, currentDate);
+      const dynamicStartAtIndex = getStartAtIndex(startYear, endYear);
+      const totalMonths = getTotalMonths(startYear, endYear);
+      const newIndex = dynamicStartAtIndex + months;
+      // Ensure the new index is within valid bounds
+      const boundedIndex = Math.max(0, Math.min(newIndex, totalMonths - 1));
+      if (currentIndex !== boundedIndex) {
+        onChangeRef.current(boundedIndex);
+      }
+    }
+  }, [currentIndexRef, onChangeRef, selectedYear, startYear, endYear]);
+}
+//# sourceMappingURL=SwiperUtils.js.map

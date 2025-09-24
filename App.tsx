@@ -1,0 +1,67 @@
+﻿import 'react-native-gesture-handler';
+import React from 'react';
+import { NavigationContainer } from '@react-navigation/native';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { Provider as PaperProvider } from 'react-native-paper';
+
+import { StatusBar } from 'expo-status-bar';
+import { ActivityIndicator, View } from 'react-native';
+
+import AppNavigator from '@/navigation/AppNavigator';
+import { AuthProvider } from '@/providers/AuthProvider';
+import { CurrencyProvider } from '@/providers/CurrencyProvider';
+import { ThemeProvider, useAppTheme } from '@/providers/ThemeProvider';
+
+import { PlanningSettingsProvider } from '@/providers/PlanningSettingsProvider';
+
+const AppShell = () => {
+  const { paperTheme, navigationTheme, isReady } = useAppTheme();
+
+  if (!isReady) {
+    return (
+      <View
+        style={{
+          flex: 1,
+          alignItems: 'center',
+          justifyContent: 'center',
+          backgroundColor: '#fff',
+        }}
+      >
+        <ActivityIndicator size="large" color="#2563eb" />
+      </View>
+    );
+  }
+
+  return (
+    <PaperProvider theme={paperTheme}>
+      <StatusBar style={navigationTheme.dark ? 'light' : 'dark'} />
+      <NavigationContainer theme={navigationTheme}>
+        <AppNavigator />
+      </NavigationContainer>
+    </PaperProvider>
+  );
+};
+
+const Providers = () => (
+  <ThemeProvider>
+    <CurrencyProvider>
+      <AuthProvider>
+        <AppShell />
+      </AuthProvider>
+    </CurrencyProvider>
+  </ThemeProvider>
+);
+
+export default function App() {
+  return (
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <SafeAreaProvider>
+        <PlanningSettingsProvider>
+          <Providers />
+        </PlanningSettingsProvider>
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
+  );
+}
+

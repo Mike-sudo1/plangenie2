@@ -1,0 +1,1 @@
+{"version":3,"file":"DisplayModeContext.d.ts","sourceRoot":"","sources":["../../../src/contexts/DisplayModeContext.tsx"],"names":[],"mappings":"AAAA,OAAO,EAAiB,QAAQ,EAAE,cAAc,EAAE,MAAM,OAAO,CAAA;AAE/D,eAAO,MAAM,kBAAkB;UACvB,IAAI,GAAG,IAAI,GAAG,SAAS;aACpB,QAAQ,CAAC,cAAc,CAAC,IAAI,GAAG,IAAI,GAAG,SAAS,CAAC,CAAC;EACvB,CAAA"}
