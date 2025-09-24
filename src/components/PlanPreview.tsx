@@ -93,17 +93,52 @@ const PlanPreview: React.FC<PlanPreviewProps> = ({
     () => currencySymbols[itinerary.currency] ?? '$',
     [itinerary.currency],
   );
-  const baseBudget = itinerary.budget_converted ?? itinerary.budget_usd ?? 0;
+
+  const totalBudget = useMemo(() => {
+    if (itinerary.budget_converted != null) return itinerary.budget_converted;
+    if (itinerary.budget_usd != null) return itinerary.budget_usd;
+    if (itinerary.daily_budget_converted != null) {
+      return itinerary.daily_budget_converted * itinerary.days.length;
+    }
+    if (itinerary.daily_budget_usd != null) {
+      return itinerary.daily_budget_usd * itinerary.days.length;
+    }
+    return 0;
+  }, [
+    itinerary.budget_converted,
+    itinerary.budget_usd,
+    itinerary.daily_budget_converted,
+    itinerary.daily_budget_usd,
+    itinerary.days.length,
+  ]);
+
+  const dailyBudget = useMemo(() => {
+    if (itinerary.daily_budget_converted != null) {
+      return itinerary.daily_budget_converted;
+    }
+    if (itinerary.daily_budget_usd != null) {
+      return itinerary.daily_budget_usd;
+    }
+    if (totalBudget && itinerary.days.length > 0) {
+      return totalBudget / itinerary.days.length;
+    }
+    return null;
+  }, [
+    itinerary.daily_budget_converted,
+    itinerary.daily_budget_usd,
+    itinerary.days.length,
+    totalBudget,
+  ]);
 
   const budgetProgress = useMemo(() => {
-    if (!baseBudget || baseBudget <= 0) return null;
-    return Math.min(itinerary.total_estimated_cost / baseBudget, 1.2);
-  }, [baseBudget, itinerary.total_estimated_cost]);
+    if (!totalBudget || totalBudget <= 0) return null;
+    return Math.min(itinerary.total_estimated_cost / totalBudget, 1.2);
+  }, [totalBudget, itinerary.total_estimated_cost]);
 
   const remainingBudget = useMemo(() => {
-    if (!baseBudget) return null;
-    return baseBudget - itinerary.total_estimated_cost;
-  }, [baseBudget, itinerary.total_estimated_cost]);
+    if (!totalBudget) return null;
+    return totalBudget - itinerary.total_estimated_cost;
+  }, [totalBudget, itinerary.total_estimated_cost]);
 
   const highlights = Array.isArray(itinerary.highlights) ? itinerary.highlights : [];
   const activeDay = itinerary.days[activeDayIndex];
@@ -189,11 +224,19 @@ const PlanPreview: React.FC<PlanPreviewProps> = ({
               <Text variant="titleMedium" style={styles.budgetLabel}>
                 Budget tracker
               </Text>
-              <Text variant="titleMedium" style={styles.budgetValue}>
-                {currencySymbol}
-                {itinerary.total_estimated_cost.toFixed(0)} / {currencySymbol}
-                {baseBudget.toFixed(0)}
-              </Text>
+              <View style={styles.budgetValueColumn}>
+                <Text variant="titleMedium" style={styles.budgetValue}>
+                  {currencySymbol}
+                  {itinerary.total_estimated_cost.toFixed(0)} / {currencySymbol}
+                  {totalBudget.toFixed(0)}
+                </Text>
+                {dailyBudget != null ? (
+                  <Text variant="bodySmall" style={styles.dailyBudgetText}>
+                    ≈ {currencySymbol}
+                    {dailyBudget.toFixed(0)} per day
+                  </Text>
+                ) : null}
+              </View>
             </View>
             <ProgressBar
               progress={Math.min(budgetProgress, 1)}
@@ -497,11 +540,18 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
   },
+  budgetValueColumn: {
+    alignItems: 'flex-end',
+  },
   budgetLabel: {
     fontWeight: '600',
   },
   budgetValue: {
     fontWeight: '600',
+  },
+  dailyBudgetText: {
+    color: palette.slate,
+    marginTop: 2,
   },
   progressBar: {
     height: 10,

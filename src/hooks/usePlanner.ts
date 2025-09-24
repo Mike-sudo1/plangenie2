@@ -104,6 +104,8 @@ const usePlanner = () => {
         total_estimated_cost: convertValue(source.total_estimated_cost),
         budget_converted:
           source.budget_usd != null ? convertValue(source.budget_usd) : undefined,
+        daily_budget_converted:
+          source.daily_budget_usd != null ? convertValue(source.daily_budget_usd) : undefined,
         days: convertedDays,
       };
     },

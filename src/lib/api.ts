@@ -53,21 +53,279 @@ export async function generateItineraryWithOpenAI({
  * @returns TripItinerary
  */
 
-// Curated multi-city routes for popular countries
-type CountryItinerary = { city: string; days: number; travel: { to: string; method: string; duration: string }[] };
-const COUNTRY_ITINERARIES: Record<string, CountryItinerary[]> = {
-  'japan': [
-    { city: 'Tokyo', days: 4, travel: [{ to: 'Hakone', method: 'Shinkansen', duration: '1h' }] },
-    { city: 'Hakone', days: 2, travel: [{ to: 'Kyoto', method: 'Shinkansen', duration: '2h' }] },
-    { city: 'Kyoto', days: 3, travel: [{ to: 'Osaka', method: 'Train', duration: '30m' }] },
-    { city: 'Osaka', days: 3, travel: [{ to: 'Hiroshima', method: 'Shinkansen', duration: '2h' }] },
-    { city: 'Hiroshima', days: 2, travel: [] },
-  ],
-  // Add more countries as needed
+const preferenceToInterests: Record<PreferenceOption, Interest[]> = {
+  Museums: ['museums', 'art'],
+  Nature: ['parks'],
+  Food: ['food'],
+  Shopping: ['shopping'],
+  Nightlife: ['nightlife'],
+  Culture: ['culture', 'landmarks'],
+  Relaxation: ['parks'],
+  Family: ['museums', 'landmarks'],
+};
+
+const translatePreferencesToInterests = (preferences: PreferenceOption[]): Interest[] => {
+  const mapped = new Set<Interest>();
+  preferences.forEach((preference) => {
+    const interests = preferenceToInterests[preference];
+    if (interests) {
+      interests.forEach((interest) => mapped.add(interest));
+    }
+  });
+  if (mapped.size === 0) {
+    mapped.add('landmarks');
+    mapped.add('culture');
+    mapped.add('food');
+  }
+  return Array.from(mapped);
+};
+
+const priceLevelToSymbol = (priceLevel?: number) => {
+  if (priceLevel === 0) return 'Free';
+  if (priceLevel === 1) return '$';
+  if (priceLevel === 2) return '$$';
+  if (priceLevel === 3) return '$$$';
+  if (priceLevel === 4) return '$$$$';
+  return '$$';
+};
+
+const minutesBetween = (start?: string, end?: string) => {
+  if (!start || !end) return null;
+  const startDate = new Date(start);
+  const endDate = new Date(end);
+  if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) return null;
+  return Math.max(0, Math.round((endDate.getTime() - startDate.getTime()) / 60000));
+};
+
+const formatDurationLabel = (minutes?: number | null) => {
+  if (minutes == null || !Number.isFinite(minutes) || minutes <= 0) return 'Flexible';
+  const hrs = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  if (hrs && mins) return `${hrs}h ${mins}m`;
+  if (hrs) return `${hrs}h`;
+  return `${mins}m`;
+};
+
+const formatTimeRange = (start?: string, end?: string) => {
+  const formatTime = (iso?: string) => {
+    if (!iso) return null;
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return null;
+    return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  };
+  const startLabel = formatTime(start);
+  const endLabel = formatTime(end);
+  if (!startLabel || !endLabel) return '';
+  return `${startLabel} - ${endLabel}`;
+};
+
+const buildCandidateLookup = (places: PlaceCandidate[] = []): Map<string, PlaceCandidate> => {
+  const lookup = new Map<string, PlaceCandidate>();
+  places.forEach((place) => {
+    if (!place) return;
+    if (place.placeId) lookup.set(`id:${place.placeId}`, place);
+    if (place.name) lookup.set(`name:${place.name.toLowerCase()}`, place);
+  });
+  return lookup;
+};
+
+const findCandidateForActivity = (
+  activity: Activity,
+  lookup: Map<string, PlaceCandidate>,
+): PlaceCandidate | undefined => {
+  if (activity.id && lookup.has(`id:${activity.id}`)) {
+    return lookup.get(`id:${activity.id}`);
+  }
+  if (activity.name) {
+    const byName = lookup.get(`name:${activity.name.toLowerCase()}`);
+    if (byName) return byName;
+  }
+  return undefined;
+};
+
+type MapActivityToStopParams = {
+  activity: Activity;
+  label: string;
+  dayIndex: number;
+  date: string;
+  category: ItineraryStop['category'];
+  previousActivity?: Activity | null;
+  candidateLookup: Map<string, PlaceCandidate>;
+  isFirstStop: boolean;
+};
+
+const mapActivityToStop = ({
+  activity,
+  label,
+  dayIndex,
+  date,
+  category,
+  previousActivity,
+  candidateLookup,
+  isFirstStop,
+}: MapActivityToStopParams): ItineraryStop => {
+  const candidate = findCandidateForActivity(activity, candidateLookup);
+  const estimatedCost = Number.isFinite(activity.estimatedCost) ? activity.estimatedCost : 0;
+  const durationMinutes = minutesBetween(activity.start, activity.end);
+  const travelGapMinutes =
+    previousActivity?.end && activity.start
+      ? minutesBetween(previousActivity.end, activity.start)
+      : null;
+
+  const travelLabel =
+    isFirstStop || travelGapMinutes == null
+      ? 'Start'
+      : `~${formatDurationLabel(travelGapMinutes)} transfer`;
+
+  const fallbackMapsUrl =
+    activity.id && activity.name
+      ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+          activity.name,
+        )}&query_place_id=${activity.id}`
+      : '';
+
+  return {
+    dayIndex,
+    date,
+    title: label,
+    description: activity.address ?? activity.notes ?? candidate?.address ?? '',
+    google_maps_url:
+      activity.googleMapsUri ??
+      candidate?.googleMapsUrl ??
+      fallbackMapsUrl,
+    photo_url: candidate?.photoUrl ?? '',
+    website_url: activity.websiteUri ?? candidate?.websiteUrl,
+    estimated_cost: priceLevelToSymbol(activity.priceLevel),
+    estimated_price_usd: Math.max(0, Math.round(estimatedCost)),
+    duration: formatDurationLabel(durationMinutes),
+    travel_time_from_previous: travelLabel,
+    time_block: formatTimeRange(activity.start, activity.end),
+    category,
+    address: activity.address ?? candidate?.address,
+  };
+};
+
+type ConvertDayPlanParams = {
+  plan: EngineDayPlan;
+  dayIndex: number;
+  candidateLookup: Map<string, PlaceCandidate>;
+  travelLeg?: TravelLeg | null;
+};
+
+const convertDayPlanToItineraryDay = ({
+  plan,
+  dayIndex,
+  candidateLookup,
+  travelLeg,
+}: ConvertDayPlanParams): { day: ItineraryDay; highlights: string[] } => {
+  const stops: ItineraryStop[] = [];
+  const highlights: string[] = [];
+  let previousActivity: Activity | null = null;
+  let firstStart: Date | null = null;
+  let lastEnd: Date | null = null;
+
+  if (travelLeg) {
+    const durationLabel = formatDurationLabel(travelLeg.durationMinutes);
+    const descriptionParts = [`Take ${travelLeg.mode} from ${travelLeg.from} to ${travelLeg.to}`];
+    if (travelLeg.distanceKm != null) {
+      descriptionParts.push(`~${travelLeg.distanceKm} km`);
+    }
+    stops.push({
+      dayIndex,
+      date: plan.date,
+      title: `Travel to ${travelLeg.to}`,
+      description: descriptionParts.join(' • '),
+      google_maps_url: '',
+      photo_url: '',
+      website_url: undefined,
+      estimated_cost: 'Free',
+      estimated_price_usd: 0,
+      duration: `${durationLabel} journey`,
+      travel_time_from_previous: 'Start',
+      time_block: 'Flexible travel window',
+      category: 'transport',
+    });
+    highlights.push(`Travel to ${travelLeg.to}`);
+  }
+
+  const segments: Array<{ activity?: Activity; label: string; category: ItineraryStop['category'] }> = [
+    { activity: plan.breakfast, label: plan.breakfast ? `Breakfast at ${plan.breakfast.name}` : 'Breakfast', category: 'food' },
+    { activity: plan.morning, label: plan.morning?.name ?? 'Morning discovery', category: 'activity' },
+    { activity: plan.lunch, label: plan.lunch ? `Lunch at ${plan.lunch.name}` : 'Lunch', category: 'food' },
+    { activity: plan.afternoon, label: plan.afternoon?.name ?? 'Afternoon highlight', category: 'activity' },
+    { activity: plan.dinner, label: plan.dinner ? `Dinner at ${plan.dinner.name}` : 'Dinner', category: 'food' },
+  ];
+
+  if (plan.evening) {
+    segments.push({
+      activity: plan.evening,
+      label: plan.evening.name,
+      category: 'activity',
+    });
+  }
+
+  segments.forEach(({ activity, label, category }) => {
+    if (!activity) return;
+    const stop = mapActivityToStop({
+      activity,
+      label,
+      dayIndex,
+      date: plan.date,
+      category,
+      previousActivity,
+      candidateLookup,
+      isFirstStop: stops.length === 0,
+    });
+    stops.push(stop);
+    highlights.push(stop.title);
+    previousActivity = activity;
+
+    const startDate = activity.start ? new Date(activity.start) : null;
+    const endDate = activity.end ? new Date(activity.end) : null;
+    if (startDate && !Number.isNaN(startDate.getTime())) {
+      if (!firstStart || startDate < firstStart) firstStart = startDate;
+    }
+    if (endDate && !Number.isNaN(endDate.getTime())) {
+      if (!lastEnd || endDate > lastEnd) lastEnd = endDate;
+    }
+  });
+
+  const estimatedSpend = stops.reduce(
+    (total, stop) => total + (stop.estimated_price_usd ?? 0),
+    0,
+  );
+
+  const totalMinutes =
+    firstStart && lastEnd
+      ? Math.max(0, Math.round((lastEnd.getTime() - firstStart.getTime()) / 60000))
+      : null;
+
+  const pace = stops.length >= 6 ? 'Energetic' : stops.length >= 4 ? 'Balanced' : 'Relaxed';
+
+  const notesParts = [`Curated experiences in ${plan.city}`];
+  if (plan.country && plan.country !== plan.city) {
+    notesParts.push(plan.country);
+  }
+  const notes = `${notesParts.join(' • ')}. Meals and activities sequenced with travel buffers.`;
+
+  return {
+    day: {
+      date: plan.date,
+      city: plan.city,
+      summary: {
+        totalTime: formatDurationLabel(totalMinutes),
+        pace,
+        notes,
+        stopsCount: stops.length,
+        estimatedSpend,
+      },
+      stops,
+    },
+    highlights,
+  };
 };
 
 export const generateTripItinerary = async (input: {
-
   city: string;
   startDate: string; // ISO date string
   endDate: string; // ISO date string
@@ -76,275 +334,123 @@ export const generateTripItinerary = async (input: {
   places: PlaceCandidate[];
   mealTimes?: { breakfast: string; lunch: string; dinner: string };
   isCountry?: boolean;
-  countryCities?: string[]; // If country, list of cities in order
+  countryCities?: string[]; // kept for compatibility
 }): Promise<TripItinerary> => {
-  function addMinutes(time: string, mins: number) {
-    const [h, m] = time.split(':').map(Number);
-    const dateObj = new Date(2000, 0, 1, h, m);
-    dateObj.setMinutes(dateObj.getMinutes() + mins);
-    return dateObj.toTimeString().slice(0, 5);
-  }
+  const candidateLookup = buildCandidateLookup(input.places);
+  const interests = translatePreferencesToInterests(input.preferences);
 
-  const mealTimes = input.mealTimes || getDefaultMealTimes();
-  const { city, startDate, endDate, preferences, budgetUsd, places, isCountry, countryCities } = input;
-  const start = new Date(startDate);
-  const end = new Date(endDate);
-  const totalDays = Math.max(1, Math.floor((end.getTime() - start.getTime()) / 86400000) + 1);
+  const start = new Date(input.startDate);
+  const end = new Date(input.endDate);
+  const fallbackDayCount =
+    Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())
+      ? 1
+      : Math.max(1, Math.round((end.getTime() - start.getTime()) / 86400000) + 1);
 
-  // If country, use curated route if available, else split days across cities
-  let cityPlan: string[] = [];
-  let travelPlan: { from: string; to: string; method: string; duration: string }[] = [];
-  let usedCountryCities: string[] = [];
-  if (isCountry) {
-    const countryKey = city.toLowerCase();
-    const itinerary = COUNTRY_ITINERARIES[countryKey];
-    if (itinerary) {
-      // Assign days per city as in curated itinerary, but scale to totalDays
-      const totalCuratedDays = itinerary.reduce((sum: number, c: CountryItinerary) => sum + c.days, 0);
-      let scale = totalDays / totalCuratedDays;
-      let assigned = 0;
-      for (let i = 0; i < itinerary.length; i++) {
-        const cityDays = i === itinerary.length - 1
-          ? totalDays - assigned // last city gets remainder
-          : Math.round(itinerary[i].days * scale);
-        assigned += cityDays;
-        for (let d = 0; d < cityDays; d++) cityPlan.push(itinerary[i].city);
-        usedCountryCities.push(itinerary[i].city);
-        if (i > 0) {
-          travelPlan.push({
-            from: itinerary[i - 1].city,
-            to: itinerary[i].city,
-            method: itinerary[i - 1].travel[0]?.method || 'Train',
-            duration: itinerary[i - 1].travel[0]?.duration || '2h',
-          });
-        }
-      }
-    } else if (countryCities && countryCities.length > 0) {
-      // Distribute days as evenly as possible
-      const base = Math.floor(totalDays / countryCities.length);
-      let remainder = totalDays % countryCities.length;
-      for (let i = 0; i < countryCities.length; i++) {
-        const daysForCity = base + (remainder > 0 ? 1 : 0);
-        remainder--;
-        for (let d = 0; d < daysForCity; d++) cityPlan.push(countryCities[i]);
-        usedCountryCities.push(countryCities[i]);
-        if (i > 0) {
-          travelPlan.push({
-            from: countryCities[i - 1],
-            to: countryCities[i],
-            method: 'Train',
-            duration: '2h',
-          });
-        }
-      }
-    } else {
-      for (let i = 0; i < totalDays; i++) cityPlan.push(city);
-      usedCountryCities.push(city);
-    }
-  } else {
-    for (let i = 0; i < totalDays; i++) cityPlan.push(city);
-    usedCountryCities.push(city);
-  }
-
-  // Categorize places
-  const hasFoodPref = preferences.map(p => p.toLowerCase()).includes('food');
-  const hasShoppingPref = preferences.map(p => p.toLowerCase()).includes('shopping');
-  const foodPlaces = places.filter(p => (p.types || []).some((t: string) => t.toLowerCase().includes('restaurant') || t.toLowerCase().includes('food')));
-  const breakfastPlaces = foodPlaces.filter(p => p.name.toLowerCase().includes('breakfast') || p.name.toLowerCase().includes('cafe'));
-  const lunchPlaces = foodPlaces.filter(p => p.name.toLowerCase().includes('lunch') || p.name.toLowerCase().includes('ramen') || p.name.toLowerCase().includes('deli'));
-  const dinnerPlaces = foodPlaces.filter(p => p.name.toLowerCase().includes('dinner') || p.name.toLowerCase().includes('steak') || p.name.toLowerCase().includes('bistro'));
-  let activityPlaces = places.filter(p => (p.types || []).some((t: string) => t.toLowerCase().includes('museum') || t.toLowerCase().includes('park') || t.toLowerCase().includes('amusement') || t.toLowerCase().includes('tourist')));
-  if (hasShoppingPref) {
-    const shoppingPlaces = places.filter(p => (p.types || []).some((t: string) => t.toLowerCase().includes('shopping_mall') || t.toLowerCase().includes('shopping') || t.toLowerCase().includes('store') || t.toLowerCase().includes('market')));
-    activityPlaces = [...activityPlaces, ...shoppingPlaces];
-  }
-
-  // No fallbacks: Only use real places. If not enough, show fewer stops.
-
-  // Track used places to avoid repeats
-  const usedPlaceIds = new Set<string>();
-
-  const days: ItineraryDay[] = cityPlan.map((cityName, dayIdx) => {
-    const dateObj = new Date(start);
-    dateObj.setDate(start.getDate() + dayIdx);
-    const date = dateObj.toISOString().slice(0, 10);
-
-    // Strict city/country filter
-    const filterByCity = (p: any) => p.address && p.address.toLowerCase().includes(cityName.toLowerCase());
-    const filterByCountry = (p: any) => !input.isCountry || (p.country && p.country.toLowerCase() === city.toLowerCase());
-    const filterByType = (p: any, type: string) => (p.types || []).some((t: string) => t.toLowerCase().includes(type));
-    const isValidPlace = (p: any) => filterByCity(p) && filterByCountry(p) && !usedPlaceIds.has(p.placeId);
-
-    // Meals: always include if food preference is chosen
-    let breakfast, lunch, dinner;
-    if (hasFoodPref) {
-      const sortedBreakfasts = breakfastPlaces.filter(isValidPlace).sort((a, b) => (b.rating || 0) - (a.rating || 0));
-      breakfast = sortedBreakfasts[0] || foodPlaces.filter(isValidPlace)[0];
-      if (breakfast) usedPlaceIds.add(breakfast.placeId);
-      const sortedLunches = lunchPlaces.filter(isValidPlace).sort((a, b) => (b.rating || 0) - (a.rating || 0));
-      lunch = sortedLunches[0] || foodPlaces.filter(isValidPlace)[1] || foodPlaces.filter(isValidPlace)[0];
-      if (lunch) usedPlaceIds.add(lunch.placeId);
-      const sortedDinners = dinnerPlaces.filter(isValidPlace).sort((a, b) => (b.rating || 0) - (a.rating || 0));
-      dinner = sortedDinners[0] || foodPlaces.filter(isValidPlace)[2] || foodPlaces.filter(isValidPlace)[0];
-      if (dinner) usedPlaceIds.add(dinner.placeId);
-    }
-
-    // Activities: real places only, top-rated, diverse
-    let availableActivities = activityPlaces.filter(isValidPlace).filter(p => (p.rating || 0) > 4.2);
-    // Prefer diversity: pick different types if possible
-    const usedTypes = new Set<string>();
-    const diverseActivities: any[] = [];
-    for (const act of availableActivities) {
-      const mainType = (act.types && act.types[0]) || '';
-      if (!usedTypes.has(mainType)) {
-        diverseActivities.push(act);
-        usedTypes.add(mainType);
-      }
-      if (diverseActivities.length >= 4) break;
-    }
-    // Always define activities, fill with fallbacks if needed
-    let activities = diverseActivities;
-    // Only use real activities. If not enough, show fewer stops for that day.
-    activities = activities.filter(a => a.placeId && a.address && a.location && a.name);
-    activities.forEach(a => a.placeId && usedPlaceIds.add(a.placeId));
-
-    // Build stops for the day in required order and time blocks, with real travel time
-    const stops: ItineraryStop[] = [];
-    const dayStops: any[] = [];
-    if (breakfast) dayStops.push({ ...breakfast, type: 'breakfast', label: `Breakfast at ${breakfast.name}`, time_block: '08:00 - 09:00', duration: 60, price: 15, category: 'food' });
-    if (activities[0]) dayStops.push({ ...activities[0], type: 'activity', label: activities[0].name, time_block: '09:30 - 11:00', duration: 90, price: activities[0].estimated_price_usd || 25, category: activities[0].category || 'activity' });
-    if (activities[1]) dayStops.push({ ...activities[1], type: 'activity', label: activities[1].name, time_block: '11:30 - 13:00', duration: 90, price: activities[1].estimated_price_usd || 25, category: activities[1].category || 'activity' });
-    if (lunch) dayStops.push({ ...lunch, type: 'lunch', label: `Lunch at ${lunch.name}`, time_block: '14:00 - 15:00', duration: 60, price: 20, category: 'food' });
-    if (activities[2]) dayStops.push({ ...activities[2], type: 'activity', label: activities[2].name, time_block: '15:30 - 17:00', duration: 90, price: activities[2].estimated_price_usd || 25, category: activities[2].category || 'activity' });
-    if (activities[3]) dayStops.push({ ...activities[3], type: 'activity', label: activities[3].name, time_block: '17:30 - 19:00', duration: 90, price: activities[3].estimated_price_usd || 25, category: activities[3].category || 'activity' });
-    if (dinner) dayStops.push({ ...dinner, type: 'dinner', label: `Dinner at ${dinner.name}`, time_block: '20:00 - 21:00', duration: 60, price: 30, category: 'food' });
-
-    // Haversine formula for travel time between stops (in minutes)
-    function haversine(lat1: number, lon1: number, lat2: number, lon2: number) {
-      const R = 6371; // km
-      const dLat = (lat2 - lat1) * Math.PI / 180;
-      const dLon = (lon2 - lon1) * Math.PI / 180;
-      const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-      return R * c;
-    }
-    for (let i = 0; i < dayStops.length; i++) {
-      let travelTime = 'Start';
-      if (i > 0) {
-        const prev = dayStops[i - 1];
-        const curr = dayStops[i];
-        if (prev.location && curr.location) {
-          // If both have placeId, try to use Google Maps directions link
-          if (prev.placeId && curr.placeId) {
-            travelTime = `Directions: https://www.google.com/maps/dir/?api=1&origin=place_id:${prev.placeId}&destination=place_id:${curr.placeId}`;
-          } else {
-            const dist = haversine(prev.location.lat, prev.location.lng, curr.location.lat, curr.location.lng);
-            if (dist < 1.5) travelTime = `${Math.round(dist * 12)} min walk`;
-            else if (dist < 7) travelTime = `${Math.round(dist * 5)} min taxi`;
-            else travelTime = `${Math.round(dist * 2)} min transit`;
-          }
-        } else {
-          travelTime = i === 1 ? '10 min walk' : (i === 2 ? '15 min taxi' : '7 min walk');
-        }
-      }
-      // Set duration based on type
-      let duration = 90;
-      if (dayStops[i].type === 'breakfast' || dayStops[i].type === 'lunch' || dayStops[i].type === 'dinner') duration = 60;
-      else if (dayStops[i].category === 'museum') duration = 90;
-      else if (dayStops[i].category === 'activity') duration = 75;
-      else if (dayStops[i].category === 'food') duration = 60;
-      // Always link website and Google Maps for real places
-      let googleMapsUrl = '';
-      if (dayStops[i].placeId) googleMapsUrl = `https://www.google.com/maps/search/?api=1&query=place_id:${dayStops[i].placeId}`;
-      else if (dayStops[i].location) googleMapsUrl = `https://www.google.com/maps/search/?api=1&query=${dayStops[i].location.lat},${dayStops[i].location.lng}`;
-      let websiteUrl = dayStops[i].websiteUrl || dayStops[i].website || undefined;
-      stops.push({
-        dayIndex: dayIdx,
-        date,
-        title: dayStops[i].label,
-        description: dayStops[i].address,
-        google_maps_url: googleMapsUrl,
-        photo_url: typeof (dayStops[i] as any).photoUrl === 'string' ? (dayStops[i] as any).photoUrl : '',
-        website_url: typeof websiteUrl === 'string' ? websiteUrl : undefined,
-        estimated_cost: '$$',
-        estimated_price_usd: dayStops[i].price,
-        duration: `${duration} min`,
-        travel_time_from_previous: travelTime,
-        time_block: dayStops[i].time_block,
-        category: dayStops[i].category,
-      });
-    }
-
-    // Sanity checks: no empty days, no duplicates, all stops in city
-    const uniqueStops = stops.filter((stop, idx, arr) =>
-      stop && stop.title && stop.description &&
-      arr.findIndex(s => s.title === stop.title && s.description === stop.description) === idx
-    );
-
-    // Wrap in ItineraryDay structure
-    return {
-      date,
-      summary: {
-        totalTime: `${uniqueStops.length * 1.5}h`,
-        pace: uniqueStops.length >= 5 ? 'Busy' : 'Relaxed',
-        notes:
-          isCountry && Array.isArray(countryCities) && countryCities.length > 0
-            ? `Explore ${cityName} as part of your ${countryCities.join(' → ')} route.`
-            : 'Includes meals and curated activities with travel times.',
-        stopsCount: uniqueStops.length,
-        estimatedSpend: uniqueStops.reduce((sum, s) => sum + (s.estimated_price_usd || 0), 0),
+  let tripPlan: EngineTripPlan;
+  try {
+    tripPlan = await engineCreateTripPlan({
+      location: input.city,
+      arrivalISO: input.startDate,
+      departureISO: input.endDate,
+      interests,
+      budgetPerDay: input.budgetUsd,
+    });
+  } catch (error) {
+    console.warn('Falling back to default itinerary builder', error);
+    return buildFallbackItinerary(
+      {
+        tripName: `${input.city} Escape`,
+        city: input.city,
+        startDate: input.startDate,
+        endDate: input.endDate,
+        dayCount: fallbackDayCount,
+        preferences: input.preferences,
+        budgetUsd: input.budgetUsd,
       },
-      stops: uniqueStops,
-    };
+      input.places,
+    );
+  }
 
-    // Removed duplicate/unguarded summary block
-  });
+  if (!tripPlan.days.length) {
+    return buildFallbackItinerary(
+      {
+        tripName: `${input.city} Escape`,
+        city: input.city,
+        startDate: input.startDate,
+        endDate: input.endDate,
+        dayCount: Math.max(tripPlan.totalNights ?? fallbackDayCount, 1),
+        preferences: input.preferences,
+        budgetUsd: input.budgetUsd,
+      },
+      input.places,
+    );
+  }
 
-  // If multi-city, add intercity travel notes with curated methods
-  if (isCountry && usedCountryCities.length > 1) {
-    let travelIdx = 0;
-    for (let i = 1; i < cityPlan.length; i++) {
-      if (cityPlan[i] !== cityPlan[i - 1]) {
-        const travel = travelPlan[travelIdx] || { from: cityPlan[i - 1], to: cityPlan[i], method: 'Train', duration: '2h' };
-        days[i].stops.unshift({
-          dayIndex: i,
-          date: days[i].date,
-          title: `Travel to ${cityPlan[i]}`,
-          description: `Take ${travel.method} from ${travel.from} to ${travel.to} (${travel.duration})`,
-          google_maps_url: '',
-          photo_url: '',
-          website_url: undefined,
-          estimated_cost: '$$',
-          estimated_price_usd: 40,
-          duration: travel.duration,
-          travel_time_from_previous: 'Start',
-          time_block: '07:00 - 09:00',
-          category: 'transport',
-        });
-        days[i].summary.stopsCount++;
-        days[i].summary.estimatedSpend += 40;
-        travelIdx++;
-      }
+  const days: ItineraryDay[] = [];
+  const highlights: string[] = [];
+  let totalSpend = 0;
+
+  const order = tripPlan.order ?? [];
+  const travelLegs = tripPlan.travel ?? [];
+
+  let stayIndex = 0;
+  let dayInCurrentStay = 0;
+
+  for (let i = 0; i < tripPlan.days.length; i++) {
+    const plan = tripPlan.days[i];
+    const currentStay = order[stayIndex];
+    const isFirstDayInStay = dayInCurrentStay === 0;
+    const travelLeg =
+      isFirstDayInStay && stayIndex > 0 ? travelLegs[stayIndex - 1] : null;
+
+    const { day, highlights: dayHighlights } = convertDayPlanToItineraryDay({
+      plan,
+      dayIndex: i,
+      candidateLookup,
+      travelLeg: travelLeg ?? null,
+    });
+
+    days.push(day);
+    highlights.push(...dayHighlights);
+    totalSpend += day.summary.estimatedSpend;
+
+    dayInCurrentStay += 1;
+    if (currentStay && dayInCurrentStay >= currentStay.nights) {
+      stayIndex += 1;
+      dayInCurrentStay = 0;
     }
   }
 
-  const totalCost = days.reduce((sum, d) => sum + d.summary.estimatedSpend, 0);
+  const uniqueHighlights = Array.from(new Set(highlights)).slice(0, 12);
+  const cityNames = order.map((stay) => stay.city);
+  const destinationLabel =
+    cityNames.length > 1 ? cityNames.join(' → ') : cityNames[0] ?? input.city;
+  const tripName =
+    cityNames.length > 1 && cityNames[0] && cityNames[cityNames.length - 1]
+      ? `${cityNames[0]} to ${cityNames[cityNames.length - 1]} Grand Tour`
+      : `${destinationLabel} Escape`;
+
+  const dayCount = Math.max(days.length, tripPlan.totalNights ?? fallbackDayCount);
+  const dailyBudget = input.budgetUsd ?? undefined;
+  const totalBudget =
+    dailyBudget != null ? dailyBudget * Math.max(dayCount, 1) : undefined;
 
   return {
-    trip_name: isCountry && usedCountryCities.length > 1 ? `${usedCountryCities[0]} to ${usedCountryCities[usedCountryCities.length - 1]} Grand Tour` : `${city} Trip`,
-    destination: isCountry && usedCountryCities.length > 1 ? usedCountryCities.join(' → ') : city,
-    start_date: startDate,
-    end_date: endDate,
+    trip_name: tripName,
+    destination: destinationLabel,
+    start_date: input.startDate,
+    end_date: input.endDate,
     currency: 'USD',
     conversion_rate: 1,
     base_currency: 'USD',
-    budget_usd: budgetUsd,
-    total_estimated_cost: totalCost,
-    highlights: days.flatMap(d => d.stops.map(s => s.title)),
+    budget_usd: totalBudget,
+    daily_budget_usd: dailyBudget,
+    total_estimated_cost: Math.round(totalSpend),
+    highlights: uniqueHighlights,
     days,
   };
 };
-import { getDefaultMealTimes } from '../providers/PlanningSettingsProvider';
+
 export const generateDayItinerary = async (input: {
   city: string;
   date: string; // ISO date string
@@ -353,147 +459,56 @@ export const generateDayItinerary = async (input: {
   places: PlaceCandidate[];
   mealTimes?: { breakfast: string; lunch: string; dinner: string };
 }): Promise<TripItinerary> => {
-  // Helper: add minutes to HH:mm string
-  function addMinutes(time: string, mins: number) {
-    const [h, m] = time.split(':').map(Number);
-    const dateObj = new Date(2000, 0, 1, h, m);
-    dateObj.setMinutes(dateObj.getMinutes() + mins);
-    return dateObj.toTimeString().slice(0, 5);
-  }
+  const candidateLookup = buildCandidateLookup(input.places);
+  const interests = translatePreferencesToInterests(input.preferences);
 
-  // Use provided mealTimes or defaults
-  const mealTimes = input.mealTimes || getDefaultMealTimes();
-  const { city, date, preferences, budgetUsd, places } = input;
-
-  // Strict city/country filter
-  const filterByCity = (p: any) => p.address && p.address.toLowerCase().includes(city.toLowerCase());
-  const filterByCountry = (p: any) => !p.country || (p.country && p.country.toLowerCase() === city.toLowerCase());
-  // Prioritize top-rated, diverse, and meal-specific
-  const foodPlaces = places.filter(p => (p.types || []).some((t: string) => t.toLowerCase().includes('restaurant') || t.toLowerCase().includes('food')) && filterByCity(p) && filterByCountry(p)).sort((a, b) => (b.rating || 0) - (a.rating || 0));
-  const breakfastPlace = foodPlaces.find(p => p.name.toLowerCase().includes('breakfast') || (p.types || []).includes('cafe')) || foodPlaces[0];
-  const lunchPlace = foodPlaces.find(p => p.name.toLowerCase().includes('lunch') || (p.types || []).includes('deli')) || foodPlaces[1] || foodPlaces[0];
-  const dinnerPlace = foodPlaces.find(p => p.name.toLowerCase().includes('dinner') || (p.types || []).includes('bistro')) || foodPlaces[2] || foodPlaces[0];
-
-  // Activities: real places only, top-rated, diverse
-  let activityPlaces = places.filter(p => (p.types || []).some((t: string) => ['museum','park','amusement','tourist','art_gallery','zoo','aquarium','landmark','shopping_mall','stadium','spa','temple','church','historic'].some(cat => t.toLowerCase().includes(cat))) && filterByCity(p) && filterByCountry(p) && (p.rating || 0) > 4.2);
-  // Prefer diversity: pick different types if possible
-  const usedTypes = new Set<string>();
-  const diverseActivities: any[] = [];
-  for (const act of activityPlaces) {
-    const mainType = (act.types && act.types[0]) || '';
-    if (!usedTypes.has(mainType)) {
-      diverseActivities.push(act);
-      usedTypes.add(mainType);
-    }
-    if (diverseActivities.length >= 4) break;
-  }
-  // Only use real activities. If not enough, show fewer stops for that day.
-  let allActivities = diverseActivities.filter(a => a.placeId && a.address && a.location && a.name);
-
-  // Build stops: breakfast, 2–4 activities, lunch, dinner, with real travel times
-  const stops: ItineraryStop[] = [];
-  // Breakfast
-  if (breakfastPlace) {
-    stops.push({
-      dayIndex: 0,
-      date,
-      title: `Breakfast at ${breakfastPlace.name}`,
-      description: breakfastPlace.address,
-      google_maps_url: typeof (breakfastPlace as any).googleMapsUrl === 'string' ? (breakfastPlace as any).googleMapsUrl : '',
-      photo_url: typeof (breakfastPlace as any).photoUrl === 'string' ? (breakfastPlace as any).photoUrl : '',
-      website_url: typeof (breakfastPlace as any).websiteUrl === 'string' ? (breakfastPlace as any).websiteUrl : undefined,
-      estimated_cost: '$$',
-      estimated_price_usd: 15,
-      duration: '1h',
-      travel_time_from_previous: 'Start',
-      time_block: `${mealTimes.breakfast} - ${addMinutes(mealTimes.breakfast, 60)}`,
-      category: 'food',
+  try {
+    const plan = await engineCreateDayPlan({
+      location: input.city,
+      dateISO: input.date,
+      interests,
+      budgetPerDay: input.budgetUsd,
     });
-  }
-  // Activities (2–4)
-  for (let i = 0; i < Math.min(4, allActivities.length); i++) {
-    const act = allActivities[i];
-    stops.push({
-      dayIndex: 0,
-      date,
-      title: act.name,
-      description: act.address,
-      google_maps_url: typeof (act as any).googleMapsUrl === 'string' ? (act as any).googleMapsUrl : '',
-      photo_url: typeof (act as any).photoUrl === 'string' ? (act as any).photoUrl : '',
-      website_url: typeof (act as any).websiteUrl === 'string' ? (act as any).websiteUrl : undefined,
-      estimated_cost: '$$',
-      estimated_price_usd: 'estimated_price_usd' in act ? (act as any).estimated_price_usd : 25,
-      duration: 'duration' in act ? (act as any).duration : '1.5h',
-      travel_time_from_previous: i === 0 ? '10 min walk' : (i === 1 ? '15 min taxi' : '7 min walk'),
-      time_block: i === 0 ? `${addMinutes(mealTimes.breakfast, 75)} - ${addMinutes(mealTimes.lunch, -60)}` : (i === 1 ? `${addMinutes(mealTimes.lunch, 90)} - ${addMinutes(mealTimes.dinner, -60)}` : ''),
-      category: 'category' in act ? (act as any).category : 'activity',
-    });
-  }
-  // Lunch
-  if (lunchPlace) {
-    stops.push({
-      dayIndex: 0,
-      date,
-      title: `Lunch at ${lunchPlace.name}`,
-      description: lunchPlace.address,
-      google_maps_url: typeof (lunchPlace as any).googleMapsUrl === 'string' ? (lunchPlace as any).googleMapsUrl : '',
-      photo_url: typeof (lunchPlace as any).photoUrl === 'string' ? (lunchPlace as any).photoUrl : '',
-      website_url: typeof (lunchPlace as any).websiteUrl === 'string' ? (lunchPlace as any).websiteUrl : undefined,
-      estimated_cost: '$$',
-      estimated_price_usd: 20,
-      duration: '1h',
-      travel_time_from_previous: '8 min walk',
-      time_block: `${mealTimes.lunch} - ${addMinutes(mealTimes.lunch, 60)}`,
-      category: 'food',
-    });
-  }
-  // Dinner
-  if (dinnerPlace) {
-    stops.push({
-      dayIndex: 0,
-      date,
-      title: `Dinner at ${dinnerPlace.name}`,
-      description: dinnerPlace.address,
-      google_maps_url: typeof (dinnerPlace as any).googleMapsUrl === 'string' ? (dinnerPlace as any).googleMapsUrl : '',
-      photo_url: typeof (dinnerPlace as any).photoUrl === 'string' ? (dinnerPlace as any).photoUrl : '',
-      website_url: typeof (dinnerPlace as any).websiteUrl === 'string' ? (dinnerPlace as any).websiteUrl : undefined,
-      estimated_cost: '$$$',
-      estimated_price_usd: 30,
-      duration: '1h',
-      travel_time_from_previous: '10 min walk',
-      time_block: `${mealTimes.dinner} - ${addMinutes(mealTimes.dinner, 60)}`,
-      category: 'food',
-    });
-  }
 
-  const totalCost = stops.reduce((sum, s) => sum + (s.estimated_price_usd || 0), 0);
+    const { day, highlights } = convertDayPlanToItineraryDay({
+      plan,
+      dayIndex: 0,
+      candidateLookup,
+    });
 
-  return {
-    trip_name: `${city} Day Plan`,
-    destination: city,
-    start_date: date,
-    end_date: date,
-    currency: 'USD',
-    conversion_rate: 1,
-    base_currency: 'USD',
-    budget_usd: budgetUsd,
-    total_estimated_cost: totalCost,
-    highlights: stops.map(s => s.title),
-    days: [
+    const spend = Math.round(day.summary.estimatedSpend);
+    const dailyBudget = input.budgetUsd ?? spend;
+
+    return {
+      trip_name: `${input.city} Day Plan`,
+      destination: input.city,
+      start_date: input.date,
+      end_date: input.date,
+      currency: 'USD',
+      conversion_rate: 1,
+      base_currency: 'USD',
+      budget_usd: dailyBudget,
+      daily_budget_usd: dailyBudget,
+      total_estimated_cost: spend,
+      highlights: Array.from(new Set(highlights)),
+      days: [day],
+    };
+  } catch (error) {
+    console.warn('Falling back to simple day itinerary', error);
+    return buildFallbackItinerary(
       {
-        date,
-        summary: {
-          totalTime: 'Full day',
-          pace: 'Balanced',
-          notes: 'Includes meals and curated activities with travel times.',
-          stopsCount: stops.length,
-          estimatedSpend: totalCost,
-        },
-        stops,
+        tripName: `${input.city} Day Plan`,
+        city: input.city,
+        startDate: input.date,
+        endDate: input.date,
+        dayCount: 1,
+        preferences: input.preferences,
+        budgetUsd: input.budgetUsd,
       },
-    ],
-	};
-}
+      input.places,
+    );
+  }
+};
 
 import { Platform } from 'react-native';
 
@@ -503,6 +518,17 @@ import {
   TripItinerary,
   ItineraryDay,
 } from '../types/plans';
+import {
+  Activity,
+  DayPlan as EngineDayPlan,
+  Interest,
+  TripPlan as EngineTripPlan,
+  TravelLeg,
+} from '../types';
+import {
+  createDayPlan as engineCreateDayPlan,
+  createTripPlan as engineCreateTripPlan,
+} from '../engine/createPlan';
 import { GOOGLE_API_KEY, OPENAI_API_KEY } from './env';
 
 export type GeocodedLocation = {
@@ -524,6 +550,8 @@ export type PlaceCandidate = {
     lat: number;
     lng: number;
   };
+  city?: string;
+  country?: string;
   rating?: number;
   types?: string[];
   googleMapsUrl?: string;
@@ -555,7 +583,7 @@ const extractPlaceId = (resourceName?: string | null) => {
 
 const buildPhotoUrl = (photoName?: string | null) => {
   if (!photoName || !GOOGLE_API_KEY) return undefined;
-    return `https://places.googleapis.com/v1/${photoName}/media?maxHeightPx=800&key=${GOOGLE_API_KEY}`;
+  return `https://places.googleapis.com/v1/${photoName}/media?maxHeightPx=800&key=${GOOGLE_API_KEY}`;
 };
 
 const fetchJson = async <T>(url: string, init?: RequestInit): Promise<T> => {
@@ -650,6 +678,17 @@ const extractCountryFromAddress = (address?: string) => {
     .map((segment) => segment.trim())
     .filter(Boolean);
   return segments.length > 0 ? segments[segments.length - 1] : undefined;
+};
+
+const extractCityFromAddress = (address?: string) => {
+  if (!address) return undefined;
+  const segments = address
+    .split(',')
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  if (segments.length <= 1) return segments[0];
+  if (segments.length === 2) return segments[0];
+  return segments[segments.length - 2];
 };
 
 export const geocodeCity = async (city: string): Promise<GeocodedLocation> => {
@@ -762,14 +801,25 @@ export const fetchPreferencePlaces = async (
           ? buildPhotoUrl(place.photos[0].name)
           : undefined;
 
+        const formattedAddress = place.formattedAddress ?? queryRegion;
+        const countryName =
+          extractCountryFromAddress(formattedAddress) ??
+          location.country ??
+          queryRegion;
+        const cityName = location.isCountry
+          ? extractCityFromAddress(formattedAddress)
+          : location.city ?? extractCityFromAddress(formattedAddress);
+
         uniquePlaces.set(placeId, {
           name: place.displayName?.text ?? 'Point of interest',
           placeId,
-          address: place.formattedAddress ?? queryRegion,
+          address: formattedAddress,
           location: {
             lat: place.location?.latitude ?? location.latitude,
             lng: place.location?.longitude ?? location.longitude,
           },
+          city: cityName ?? undefined,
+          country: countryName ?? undefined,
           rating: place.rating,
           types: place.types,
           googleMapsUrl: place.googleMapsUri,

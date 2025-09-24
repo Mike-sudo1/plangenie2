@@ -60,6 +60,8 @@ export type TripItinerary = {
   base_currency: 'USD';
   budget_usd?: number;
   budget_converted?: number;
+  daily_budget_usd?: number;
+  daily_budget_converted?: number;
   total_estimated_cost: number;
   highlights: string[];
   weatherSummary?: string;
