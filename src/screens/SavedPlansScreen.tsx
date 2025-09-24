@@ -190,11 +190,18 @@ const SavedPlansScreen = () => {
             1;
           const currency = itineraryData?.currency ?? 'USD';
           const symbol = currencySymbols[currency] ?? '$';
-          const budgetDisplay =
-            itineraryData?.budget_converted ?? itineraryData?.budget_usd;
-          const budgetLabel = budgetDisplay
-            ? `${symbol}${budgetDisplay.toFixed(0)} per day`
-            : 'Flexible budget';
+          const totalBudget =
+            itineraryData?.budget_converted ?? itineraryData?.budget_usd ?? null;
+          const dailyBudget =
+            itineraryData?.daily_budget_converted ??
+            itineraryData?.daily_budget_usd ??
+            (totalBudget != null
+              ? totalBudget / Math.max(durationDays, 1)
+              : null);
+          const budgetLabel =
+            dailyBudget != null
+              ? `${symbol}${dailyBudget.toFixed(0)} per day`
+              : 'Flexible budget';
 
           return (
             <Surface key={trip.id} style={styles.tripCard} elevation={1}>
